@@ -6,3 +6,8 @@ token.json
 .env
 *.pyc
 data/*.db
+*.db
+*.db-wal
+*.db-shm
+*.bak.*
+logs/
