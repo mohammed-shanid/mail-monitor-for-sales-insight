@@ -11,3 +11,4 @@ data/*.db
 *.db-shm
 *.bak.*
 logs/
+PHASE0_AUDIT.md PHASE0_DECISIONS.md
