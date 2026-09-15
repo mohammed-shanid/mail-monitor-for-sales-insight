@@ -11,6 +11,7 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import anthropic
 import httpx
 import pytest
 
@@ -260,6 +261,264 @@ def test_summarize_enquiry_returns_none_on_rate_limit():
         )
 
     assert result is None
+
+
+# =============================================================================
+# Report path (SPEC.md §15), added Stage 3. Everything above is unchanged
+# and still exercises extract_new_enquiry/classify_reply_intent/
+# summarize_enquiry and the bot's own prompts exclusively.
+# =============================================================================
+
+import app.ai.claude as claude_module
+from app.ai.claude import classify_message, generate_summary
+from app.enquiry.models import Verdict
+
+
+def _full_verdict_payload(**overrides) -> dict:
+    payload = {
+        "is_enquiry": True,
+        "counterparty_type": "customer",
+        "customer_name": "Ramesh Kumar",
+        "company": "ABC Industries",
+        "product": "MCCB 250A",
+        "requirement": "Price and availability for 20 units",
+        "quantity": "20 nos",
+        "brands": ["Schneider"],
+        "quotation_signal": "rfq_received",
+        "closure_signal": False,
+        "closure_evidence": None,
+        "closure_kind": None,
+        "urgency": False,
+        "urgency_evidence": None,
+        "confidence": "high",
+    }
+    payload.update(overrides)
+    return payload
+
+
+# --- classify_message ---------------------------------------------------
+
+
+def test_classify_message_happy_path():
+    payload = _full_verdict_payload()
+    with patch("app.ai.claude._client", return_value=mock_client_returning(fake_response(payload))):
+        result = classify_message(
+            target_subject="MCCB Requirement",
+            target_body="We need 20 Schneider MCCB 250A units, please quote.",
+            context_messages=[],
+        )
+
+    assert isinstance(result, Verdict)
+    assert result.is_enquiry is True
+    assert result.customer_name == "Ramesh Kumar"
+    assert result.brands == ["Schneider"]
+    assert result.quotation_signal == "rfq_received"
+
+
+def test_classify_message_every_field_null_is_valid():
+    payload = _full_verdict_payload(
+        is_enquiry=None, counterparty_type=None, customer_name=None, company=None,
+        product=None, requirement=None, quantity=None, quotation_signal=None,
+        closure_signal=None, urgency=None, confidence=None, brands=[],
+    )
+    with patch("app.ai.claude._client", return_value=mock_client_returning(fake_response(payload))):
+        result = classify_message(target_subject="s", target_body="b", context_messages=[])
+
+    assert result.is_enquiry is None
+    assert result.customer_name is None
+    assert result.brands == []
+
+
+def test_classify_message_includes_context_in_request():
+    payload = _full_verdict_payload()
+    captured = {}
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        return fake_response(payload)
+
+    client = MagicMock()
+    client.messages.create.side_effect = fake_create
+
+    with patch("app.ai.claude._client", return_value=client):
+        classify_message(
+            target_subject="Re: MCCB Requirement",
+            target_body="Yes please proceed with the order.",
+            context_messages=[{"sender": "purchase@abc.com", "body": "We need 20 MCCB units."}],
+        )
+
+    user_message = captured["messages"][0]["content"]
+    assert "We need 20 MCCB units." in user_message
+    assert "Yes please proceed with the order." in user_message
+    assert "TARGET MESSAGE" in user_message
+
+
+def test_classify_message_passes_temperature_zero():
+    payload = _full_verdict_payload()
+    captured = {}
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        return fake_response(payload)
+
+    client = MagicMock()
+    client.messages.create.side_effect = fake_create
+
+    with patch("app.ai.claude._client", return_value=client):
+        classify_message(target_subject="s", target_body="b", context_messages=[])
+
+    assert captured["temperature"] == 0
+
+
+def test_classify_message_rejects_quotation_signal_outside_enum():
+    payload = _full_verdict_payload(quotation_signal="made_up_signal")
+    with patch("app.ai.claude._client", return_value=mock_client_returning(fake_response(payload))):
+        result = classify_message(target_subject="s", target_body="b", context_messages=[])
+    assert result is None
+
+
+def test_classify_message_rejects_closure_kind_outside_enum():
+    payload = _full_verdict_payload(closure_signal=True, closure_kind="made_up_kind")
+    with patch("app.ai.claude._client", return_value=mock_client_returning(fake_response(payload))):
+        result = classify_message(target_subject="s", target_body="b", context_messages=[])
+    assert result is None
+
+
+def test_classify_message_rejects_missing_field():
+    payload = _full_verdict_payload()
+    del payload["closure_kind"]
+    with patch("app.ai.claude._client", return_value=mock_client_returning(fake_response(payload))):
+        result = classify_message(target_subject="s", target_body="b", context_messages=[])
+    assert result is None
+
+
+def test_classify_message_rejects_non_list_brands():
+    payload = _full_verdict_payload(brands="Schneider")  # should be a list
+    with patch("app.ai.claude._client", return_value=mock_client_returning(fake_response(payload))):
+        result = classify_message(target_subject="s", target_body="b", context_messages=[])
+    assert result is None
+
+
+def test_classify_message_returns_none_on_malformed_json():
+    bad_response = SimpleNamespace(content=[SimpleNamespace(type="text", text="not json")])
+    with patch("app.ai.claude._client", return_value=mock_client_returning(bad_response)):
+        result = classify_message(target_subject="s", target_body="b", context_messages=[])
+    assert result is None
+
+
+# --- retry behaviour (_request_with_retry) -----------------------------------
+
+
+def test_classify_message_retries_on_rate_limit_then_succeeds(monkeypatch):
+    monkeypatch.setattr(claude_module.time, "sleep", lambda seconds: None)  # no real waiting in tests
+
+    exc = anthropic.RateLimitError("rate limited", response=_fake_httpx_response(429), body=None)
+    payload = _full_verdict_payload()
+    client = MagicMock()
+    client.messages.create.side_effect = [exc, fake_response(payload)]
+
+    with patch("app.ai.claude._client", return_value=client):
+        result = classify_message(target_subject="s", target_body="b", context_messages=[], max_retries=3)
+
+    assert result is not None
+    assert client.messages.create.call_count == 2
+
+
+def test_classify_message_gives_up_after_max_retries(monkeypatch):
+    monkeypatch.setattr(claude_module.time, "sleep", lambda seconds: None)
+
+    exc = anthropic.RateLimitError("rate limited", response=_fake_httpx_response(429), body=None)
+    client = MagicMock()
+    client.messages.create.side_effect = exc  # always raises
+
+    with patch("app.ai.claude._client", return_value=client):
+        result = classify_message(target_subject="s", target_body="b", context_messages=[], max_retries=2)
+
+    assert result is None
+    assert client.messages.create.call_count == 3  # initial attempt + 2 retries
+
+
+def test_classify_message_does_not_retry_on_non_retryable_status_error(monkeypatch):
+    monkeypatch.setattr(claude_module.time, "sleep", lambda seconds: (_ for _ in ()).throw(AssertionError("should not sleep")))
+
+    exc = anthropic.APIStatusError("bad request", response=_fake_httpx_response(400), body=None)
+    client = MagicMock()
+    client.messages.create.side_effect = exc
+
+    with patch("app.ai.claude._client", return_value=client):
+        result = classify_message(target_subject="s", target_body="b", context_messages=[], max_retries=3)
+
+    assert result is None
+    assert client.messages.create.call_count == 1  # no retry attempted
+
+
+def test_classify_message_retries_on_5xx_status_error(monkeypatch):
+    monkeypatch.setattr(claude_module.time, "sleep", lambda seconds: None)
+
+    exc = anthropic.APIStatusError("server error", response=_fake_httpx_response(503), body=None)
+    payload = _full_verdict_payload()
+    client = MagicMock()
+    client.messages.create.side_effect = [exc, fake_response(payload)]
+
+    with patch("app.ai.claude._client", return_value=client):
+        result = classify_message(target_subject="s", target_body="b", context_messages=[], max_retries=3)
+
+    assert result is not None
+    assert client.messages.create.call_count == 2
+
+
+# --- generate_summary ---------------------------------------------------
+
+
+def test_generate_summary_happy_path():
+    with patch(
+        "app.ai.claude._client",
+        return_value=mock_client_returning(fake_text_response("24 enquiries came in, 19 were attended.")),
+    ):
+        result = generate_summary({"received": 24, "attended": 19})
+
+    assert result == "24 enquiries came in, 19 were attended."
+
+
+def test_generate_summary_sends_only_metrics_json_no_raw_email():
+    captured = {}
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        return fake_text_response("Summary text.")
+
+    client = MagicMock()
+    client.messages.create.side_effect = fake_create
+
+    with patch("app.ai.claude._client", return_value=client):
+        generate_summary({"received": 24, "attended": 19, "pending": 5})
+
+    user_message = captured["messages"][0]["content"]
+    assert "24" in user_message
+    assert "19" in user_message
+    # Never any email-shaped content -- just the JSON metrics payload.
+    assert user_message.startswith("{")
+    assert captured["temperature"] == 0
+
+
+def test_generate_summary_returns_none_on_empty_response():
+    empty_response = SimpleNamespace(content=[])
+    with patch("app.ai.claude._client", return_value=mock_client_returning(empty_response)):
+        result = generate_summary({"received": 1})
+    assert result is None
+
+
+def test_generate_summary_returns_none_on_rate_limit_after_retries(monkeypatch):
+    monkeypatch.setattr(claude_module.time, "sleep", lambda seconds: None)
+    exc = anthropic.RateLimitError("rate limited", response=_fake_httpx_response(429), body=None)
+    client = MagicMock()
+    client.messages.create.side_effect = exc
+
+    with patch("app.ai.claude._client", return_value=client):
+        result = generate_summary({"received": 1}, max_retries=1)
+
+    assert result is None
+    assert client.messages.create.call_count == 2
 
 
 if __name__ == "__main__":

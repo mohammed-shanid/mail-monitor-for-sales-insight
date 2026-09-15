@@ -29,9 +29,9 @@ cases open -- documenting the choices made here):
 from __future__ import annotations
 
 from email.utils import parseaddr
-from typing import Optional
+from typing import List, Optional
 
-from app.enquiry.models import LastSender, Status
+from app.enquiry.models import AddressClass, Direction, LastSender, Status
 
 # Deliberately simple keyword match -- good enough to distinguish "here
 # is your quote" from an ordinary reply, without spending a Claude call
@@ -123,3 +123,57 @@ def next_status_for_message(
 
     # OTHER: too ambiguous to act on -- leave status unchanged.
     return current_status
+
+
+# =============================================================================
+# Report path (SPEC.md), added Stage 2. `classify_sender` above is untouched
+# and still used by the bot; `classify_address` is the report path's own
+# richer classification -- employee vs internal colleague vs everyone else
+# (SPEC.md §0 Glossary, §6.1, §6.2) -- needed because "employee" and
+# "internal" are NOT the same set for the report path (the bot's single
+# COMPANY_EMAIL_DOMAIN conflates them; SPEC.md separates REPORT_MAILBOX +
+# EMPLOYEE_ALIASES from INTERNAL_DOMAINS).
+# =============================================================================
+
+
+def classify_address(
+    address_or_header: str,
+    *,
+    mailbox: str,
+    employee_aliases: Optional[List[str]] = None,
+    internal_domains: Optional[List[str]] = None,
+) -> str:
+    """employee | internal | external, per SPEC.md §0/§6.1/§6.2.
+
+    `mailbox` and each entry of `employee_aliases` are matched as full
+    addresses (case-insensitive) -- an address IS the employee only if
+    it equals one of these exactly, never by domain alone (a colleague
+    on the same domain is `internal`, not `employee`). `internal_domains`
+    matches by domain only. Everything else is `external`.
+    """
+    address = extract_email_address(address_or_header)
+    if not address:
+        return AddressClass.EXTERNAL
+
+    address_lower = address.lower()
+    employee_addresses = {mailbox.strip().lower()} if mailbox else set()
+    employee_addresses.update(alias.strip().lower() for alias in (employee_aliases or []) if alias)
+
+    if address_lower in employee_addresses:
+        return AddressClass.EMPLOYEE
+
+    domain = address_lower.rsplit("@", 1)[-1] if "@" in address_lower else ""
+    if domain and domain in {d.strip().lower() for d in (internal_domains or []) if d}:
+        return AddressClass.INTERNAL
+
+    return AddressClass.EXTERNAL
+
+
+def direction_for_address_class(address_class: str) -> str:
+    """SPEC.md §6.1: sender matches employee identity -> outbound;
+    otherwise -> inbound. An internal colleague is not the employee, so
+    a colleague's message is `inbound` too -- direction is a raw fact
+    about who sent it, not a judgement about who is being waited on
+    (that is enquiry state, computed separately in Stage 3).
+    """
+    return Direction.OUTBOUND if address_class == AddressClass.EMPLOYEE else Direction.INBOUND

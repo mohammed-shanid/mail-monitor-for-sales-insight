@@ -345,5 +345,298 @@ def test_rollback_on_exception_leaves_no_partial_writes(db_path):
         assert not email_exists(conn, "msg-rollback")
 
 
+# =============================================================================
+# Report path (SPEC.md §14), added Stage 2 -- app.database.db.get_report_
+# connection / app.database.schema.migrate(). Everything above is untouched
+# and still exercises the bot's own get_connection()/init_db() exclusively.
+# =============================================================================
+
+import sqlite3 as _sqlite3
+from pathlib import Path
+
+from app.database import schema
+from app.database.db import DatabaseError, get_report_connection
+from app.database.queries import (
+    count_report_emails,
+    count_report_threads,
+    get_report_email_by_message_id,
+    get_report_emails_by_thread,
+    get_schema_meta,
+    report_email_exists,
+    upsert_report_email,
+)
+
+
+def _create_legacy_bot_db(path: str) -> None:
+    """Populate `path` with the bot's OLD-shaped emails/enquiries
+    tables and a couple of rows -- simulates the real pre-Stage-2
+    data/regency.db so migration tests exercise the actual detect +
+    backup + rebuild path, not just a fresh file.
+    """
+    conn = _sqlite3.connect(path)
+    for statement in schema.ALL_STATEMENTS:
+        conn.execute(statement)
+    conn.execute(
+        "INSERT INTO emails (gmail_message_id, gmail_thread_id, sender, recipient, "
+        "subject, body, received_at, processed) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("legacy-msg-1", "legacy-thread-1", "a@example.com", "b@example.com", "s", "b", now_iso(), 1),
+    )
+    conn.execute(
+        "INSERT INTO enquiries (gmail_thread_id, customer_name, customer_email, subject, "
+        "product, quantity, status, last_sender, received_at, last_activity_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("legacy-thread-1", "ABC", "a@example.com", "s", "p", 1, "NEW", "customer", now_iso(), now_iso()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_get_report_connection_creates_report_schema_on_fresh_file(db_path):
+    with get_report_connection(db_path) as conn:
+        tables = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    assert {"schema_meta", "emails", "enquiries", "enquiry_brands", "ai_verdicts", "report_runs"} <= tables
+
+
+def test_get_report_connection_report_schema_has_mailbox_column(db_path):
+    with get_report_connection(db_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(enquiries)")}
+    assert "mailbox" in columns
+    assert "closure_kind" in columns
+
+
+def test_get_report_connection_is_idempotent_across_calls(db_path):
+    with get_report_connection(db_path) as conn:
+        upsert_report_email(
+            conn,
+            gmail_message_id="m1",
+            gmail_thread_id="t1",
+            sender="a@example.com",
+            sender_domain="example.com",
+            recipient="b@example.com",
+            subject="Hi",
+            body="body",
+            received_at=1000,
+            direction="inbound",
+            is_auto_reply=False,
+            has_attachments=False,
+            ingested_at=2000,
+        )
+
+    with get_report_connection(db_path) as conn:
+        assert report_email_exists(conn, "m1")
+        # Re-opening (e.g. a second run) must not wipe existing tables/data.
+        assert count_report_emails(conn) == 1
+
+
+def test_get_report_connection_migrates_legacy_bot_schema_in_place(tmp_path):
+    db_path = str(tmp_path / "legacy.db")
+    _create_legacy_bot_db(db_path)
+
+    with get_report_connection(db_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(enquiries)")}
+        assert "mailbox" in columns  # rebuilt to the new shape
+        # Old rows are gone -- rebuilt, not preserved (PHASE0_DECISIONS.md Q3).
+        assert count_report_emails(conn) == 0
+        assert conn.execute("SELECT COUNT(*) AS n FROM enquiries").fetchone()["n"] == 0
+
+
+def test_get_report_connection_backs_up_before_migrating_legacy_schema(tmp_path):
+    db_path = str(tmp_path / "legacy.db")
+    _create_legacy_bot_db(db_path)
+
+    with get_report_connection(db_path):
+        pass
+
+    backups = list(tmp_path.glob("legacy.db.bak.*"))
+    assert len(backups) == 1
+    assert backups[0].stat().st_size > 0
+
+    # The backup holds the ORIGINAL old-shaped data, untouched.
+    backup_conn = _sqlite3.connect(f"file:{backups[0]}?mode=ro", uri=True)
+    try:
+        columns = {row[1] for row in backup_conn.execute("PRAGMA table_info(enquiries)")}
+        assert "mailbox" not in columns
+        row = backup_conn.execute("SELECT COUNT(*) FROM emails").fetchone()
+        assert row[0] == 1
+    finally:
+        backup_conn.close()
+
+
+def test_get_report_connection_does_not_back_up_a_fresh_file(tmp_path):
+    db_path = str(tmp_path / "fresh.db")
+
+    with get_report_connection(db_path):
+        pass
+
+    assert list(tmp_path.glob("fresh.db.bak.*")) == []
+
+
+def test_get_report_connection_does_not_re_migrate_already_migrated_file(db_path):
+    with get_report_connection(db_path) as conn:
+        upsert_report_email(
+            conn,
+            gmail_message_id="m1",
+            gmail_thread_id="t1",
+            sender="a@example.com",
+            sender_domain="example.com",
+            recipient=None,
+            subject=None,
+            body=None,
+            received_at=1000,
+            direction="inbound",
+            is_auto_reply=False,
+            has_attachments=False,
+            ingested_at=2000,
+        )
+
+    # Re-opening an already-migrated file must not touch existing rows
+    # (and, since it is not the legacy bot shape, must never back up).
+    with get_report_connection(db_path) as conn:
+        assert count_report_emails(conn) == 1
+
+    assert list(Path(db_path).parent.glob(Path(db_path).name + ".bak.*")) == []
+
+
+def test_migrate_records_schema_version_in_schema_meta(db_path):
+    with get_report_connection(db_path) as conn:
+        version = get_schema_meta(conn, "report_schema_version")
+    assert version == schema.REPORT_SCHEMA_VERSION
+
+
+def test_migrate_backup_verification_failure_raises_database_error(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "legacy.db")
+    _create_legacy_bot_db(db_path)
+
+    # Simulate a backup that comes out empty (e.g. disk full, copy
+    # truncated) -- must raise DatabaseError rather than proceed to
+    # drop the original tables.
+    monkeypatch.setattr(
+        "app.database.db.shutil.copy2", lambda src, dst: Path(dst).write_bytes(b"")
+    )
+
+    with pytest.raises(DatabaseError, match="empty"):
+        with get_report_connection(db_path):
+            pass
+
+    # Original legacy file must be untouched -- migration never ran.
+    conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(enquiries)")}
+        assert "mailbox" not in columns
+    finally:
+        conn.close()
+
+
+# --- upsert_report_email idempotency (ON CONFLICT DO NOTHING) ---------------
+
+
+def test_upsert_report_email_idempotent(db_path):
+    with get_report_connection(db_path) as conn:
+        first = upsert_report_email(
+            conn,
+            gmail_message_id="dup-1",
+            gmail_thread_id="t1",
+            sender="a@example.com",
+            sender_domain="example.com",
+            recipient="b@example.com",
+            subject="s",
+            body="b",
+            received_at=1000,
+            direction="inbound",
+            is_auto_reply=False,
+            has_attachments=False,
+            ingested_at=2000,
+        )
+        second = upsert_report_email(
+            conn,
+            gmail_message_id="dup-1",
+            gmail_thread_id="t1",
+            sender="a@example.com",
+            sender_domain="example.com",
+            recipient="b@example.com",
+            subject="s",
+            body="b",
+            received_at=1000,
+            direction="inbound",
+            is_auto_reply=False,
+            has_attachments=False,
+            ingested_at=9999,  # different value -- must NOT overwrite
+        )
+
+    assert first is True  # newly inserted
+    assert second is False  # already present, correctly skipped
+
+    with get_report_connection(db_path) as conn:
+        assert count_report_emails(conn) == 1
+        fetched = get_report_email_by_message_id(conn, "dup-1")
+        assert fetched.ingested_at == 2000  # first write wins, never overwritten
+
+
+def test_upsert_report_email_rejects_invalid_direction(db_path):
+    with get_report_connection(db_path) as conn:
+        with pytest.raises(ValueError):
+            upsert_report_email(
+                conn,
+                gmail_message_id="m1",
+                gmail_thread_id="t1",
+                sender="a@example.com",
+                sender_domain="example.com",
+                recipient=None,
+                subject=None,
+                body=None,
+                received_at=1000,
+                direction="sideways",
+                is_auto_reply=False,
+                has_attachments=False,
+                ingested_at=2000,
+            )
+
+
+def test_get_report_emails_by_thread_returns_oldest_first(db_path):
+    with get_report_connection(db_path) as conn:
+        upsert_report_email(
+            conn, gmail_message_id="m2", gmail_thread_id="t1", sender="a@x.com",
+            sender_domain="x.com", recipient=None, subject=None, body=None,
+            received_at=2000, direction="inbound", is_auto_reply=False,
+            has_attachments=False, ingested_at=3000,
+        )
+        upsert_report_email(
+            conn, gmail_message_id="m1", gmail_thread_id="t1", sender="a@x.com",
+            sender_domain="x.com", recipient=None, subject=None, body=None,
+            received_at=1000, direction="inbound", is_auto_reply=False,
+            has_attachments=False, ingested_at=3000,
+        )
+        messages = get_report_emails_by_thread(conn, "t1")
+
+    assert [m.gmail_message_id for m in messages] == ["m1", "m2"]
+
+
+def test_count_report_threads_counts_distinct_threads(db_path):
+    with get_report_connection(db_path) as conn:
+        upsert_report_email(
+            conn, gmail_message_id="m1", gmail_thread_id="t1", sender="a@x.com",
+            sender_domain="x.com", recipient=None, subject=None, body=None,
+            received_at=1000, direction="inbound", is_auto_reply=False,
+            has_attachments=False, ingested_at=3000,
+        )
+        upsert_report_email(
+            conn, gmail_message_id="m2", gmail_thread_id="t1", sender="a@x.com",
+            sender_domain="x.com", recipient=None, subject=None, body=None,
+            received_at=1500, direction="inbound", is_auto_reply=False,
+            has_attachments=False, ingested_at=3000,
+        )
+        upsert_report_email(
+            conn, gmail_message_id="m3", gmail_thread_id="t2", sender="a@x.com",
+            sender_domain="x.com", recipient=None, subject=None, body=None,
+            received_at=1600, direction="inbound", is_auto_reply=False,
+            has_attachments=False, ingested_at=3000,
+        )
+        assert count_report_emails(conn) == 3
+        assert count_report_threads(conn) == 2
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

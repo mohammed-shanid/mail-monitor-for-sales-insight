@@ -1,5 +1,12 @@
 """Incremental Gmail -> SQLite ingestion.
 
+SUPERSEDED for the report path by report.py + app.gmail.ingest as of
+Stage 2 (SPEC.md Appendix A #11, PHASE0_DECISIONS.md Q1). This module
+and scripts/sync_gmail.py are retired from use against data/regency.db
+-- they stay in the tree and stay tested (their status vocabulary and
+table shape are incompatible with report.py's), but must not be run
+concurrently with report.py against the same database file.
+
 This is where Phases 1-3 come together, implementing the mandatory
 branching rule from the project spec (section 11):
 

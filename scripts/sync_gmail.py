@@ -1,5 +1,10 @@
 """CLI entry point for Gmail -> SQLite ingestion.
 
+SUPERSEDED for the report path by report.py as of Stage 2 (SPEC.md
+Appendix A #11, PHASE0_DECISIONS.md Q1). Do not run this concurrently
+with report.py against the same database file -- their status
+vocabularies and table shapes are incompatible.
+
 For each recent Gmail message: skip if already fully processed;
 otherwise store it and either (a) run Claude's new-enquiry extraction
 (brand-new thread) or (b) run Claude's reply-intent classification

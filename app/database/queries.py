@@ -13,7 +13,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from app.enquiry.models import Email, Enquiry, LastSender, Status
+from app.enquiry.models import Direction, Email, Enquiry, LastSender, ReportEmail, Status
 
 logger = logging.getLogger(__name__)
 
@@ -423,3 +423,305 @@ def _escape_like(value: str) -> str:
     name containing '%' or '_' can't alter the query's meaning.
     """
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+# =============================================================================
+# Report path (SPEC.md), added Stage 2. Everything above is untouched and
+# still used by the bot, against its own old-shaped tables (see
+# app.database.schema module docstring). Everything below targets the
+# report schema's `emails`/`enquiries` tables (app.database.db.
+# get_report_connection) and is never called by the bot.
+# =============================================================================
+
+
+def _row_to_report_email(row: sqlite3.Row) -> ReportEmail:
+    return ReportEmail(
+        id=row["id"],
+        gmail_message_id=row["gmail_message_id"],
+        gmail_thread_id=row["gmail_thread_id"],
+        sender=row["sender"],
+        sender_domain=row["sender_domain"],
+        recipient=row["recipient"],
+        subject=row["subject"],
+        body=row["body"],
+        received_at=row["received_at"],
+        direction=row["direction"],
+        is_auto_reply=bool(row["is_auto_reply"]),
+        has_attachments=bool(row["has_attachments"]),
+        ingested_at=row["ingested_at"],
+        processed=bool(row["processed"]),
+    )
+
+
+def report_email_exists(conn: sqlite3.Connection, gmail_message_id: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM emails WHERE gmail_message_id = ?", (gmail_message_id,)
+    ).fetchone()
+    return row is not None
+
+
+def upsert_report_email(
+    conn: sqlite3.Connection,
+    *,
+    gmail_message_id: str,
+    gmail_thread_id: str,
+    sender: str,
+    sender_domain: Optional[str],
+    recipient: Optional[str],
+    subject: Optional[str],
+    body: Optional[str],
+    received_at: int,
+    direction: str,
+    is_auto_reply: bool,
+    has_attachments: bool,
+    ingested_at: int,
+) -> bool:
+    """Idempotent insert into the report path's `emails` table
+    (SPEC.md §18.1: `gmail_message_id` UNIQUE, `INSERT ... ON CONFLICT
+    DO NOTHING`). Returns True if a new row was inserted, False if this
+    message was already present -- re-running an ingest over the same
+    window never duplicates a row.
+    """
+    if direction not in Direction.ALL:
+        raise ValueError(f"Invalid direction: {direction!r}")
+
+    cursor = conn.execute(
+        """
+        INSERT INTO emails
+            (gmail_message_id, gmail_thread_id, sender, sender_domain, recipient,
+             subject, body, received_at, direction, is_auto_reply, has_attachments,
+             ingested_at, processed)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+        ON CONFLICT(gmail_message_id) DO NOTHING
+        """,
+        (
+            gmail_message_id,
+            gmail_thread_id,
+            sender,
+            sender_domain,
+            recipient,
+            subject,
+            body,
+            received_at,
+            direction,
+            int(is_auto_reply),
+            int(has_attachments),
+            ingested_at,
+        ),
+    )
+    return cursor.rowcount > 0
+
+
+def get_report_email_by_message_id(
+    conn: sqlite3.Connection, gmail_message_id: str
+) -> Optional[ReportEmail]:
+    row = conn.execute(
+        "SELECT * FROM emails WHERE gmail_message_id = ?", (gmail_message_id,)
+    ).fetchone()
+    return _row_to_report_email(row) if row else None
+
+
+def get_report_emails_by_thread(
+    conn: sqlite3.Connection, gmail_thread_id: str
+) -> List[ReportEmail]:
+    """Every stored report-path email for one Gmail thread, oldest
+    first -- the full hydrated thread that enquiry state (Stage 3) is
+    computed from.
+    """
+    rows = conn.execute(
+        "SELECT * FROM emails WHERE gmail_thread_id = ? ORDER BY received_at ASC",
+        (gmail_thread_id,),
+    ).fetchall()
+    return [_row_to_report_email(row) for row in rows]
+
+
+def count_report_emails(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT COUNT(*) AS n FROM emails").fetchone()
+    return row["n"]
+
+
+def count_report_threads(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT COUNT(DISTINCT gmail_thread_id) AS n FROM emails").fetchone()
+    return row["n"]
+
+
+def get_touched_thread_ids(conn: sqlite3.Connection, start_ms: int, end_ms: int) -> List[str]:
+    """Distinct `gmail_thread_id` values with >=1 stored message whose
+    `received_at` falls inside `[start_ms, end_ms]` inclusive --
+    SPEC.md §0's "touched thread" definition. Re-derived from the DB
+    (not carried over from the ingest step) so analysis can run
+    against whatever is actually stored, including from an earlier run.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT gmail_thread_id FROM emails WHERE received_at >= ? AND received_at <= ?",
+        (start_ms, end_ms),
+    ).fetchall()
+    return [row["gmail_thread_id"] for row in rows]
+
+
+def get_schema_meta(conn: sqlite3.Connection, key: str) -> Optional[str]:
+    row = conn.execute("SELECT value FROM schema_meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+# =============================================================================
+# AI verdict cache (SPEC.md §14.2, §15.2, §18.2), added Stage 3.
+# =============================================================================
+
+
+def get_ai_verdict_row(
+    conn: sqlite3.Connection, gmail_message_id: str, prompt_version: str
+) -> Optional[sqlite3.Row]:
+    """The raw cached row for one (message, prompt_version), or None on
+    a cache miss. Returns the row (not just the JSON) so callers can
+    also see `model`/`created_at` without a second query.
+    """
+    return conn.execute(
+        "SELECT * FROM ai_verdicts WHERE gmail_message_id = ? AND prompt_version = ?",
+        (gmail_message_id, prompt_version),
+    ).fetchone()
+
+
+def upsert_ai_verdict(
+    conn: sqlite3.Connection,
+    *,
+    gmail_message_id: str,
+    prompt_version: str,
+    model: str,
+    verdict_json: str,
+    created_at: int,
+) -> None:
+    """Write (or overwrite, for `--reprocess`) the cached verdict for
+    one (message, prompt_version). PRIMARY KEY is the pair, so a
+    re-analysis of the same message under the same prompt version
+    replaces the row rather than duplicating it.
+    """
+    conn.execute(
+        """
+        INSERT INTO ai_verdicts (gmail_message_id, prompt_version, model, verdict_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(gmail_message_id, prompt_version) DO UPDATE SET
+            model = excluded.model,
+            verdict_json = excluded.verdict_json,
+            created_at = excluded.created_at
+        """,
+        (gmail_message_id, prompt_version, model, verdict_json, created_at),
+    )
+
+
+def count_ai_verdicts(conn: sqlite3.Connection, prompt_version: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM ai_verdicts WHERE prompt_version = ?", (prompt_version,)
+    ).fetchone()
+    return row["n"]
+
+
+# =============================================================================
+# `enquiries` / `enquiry_brands` / `report_runs` (SPEC.md §14.2), added
+# Stage 4. `enquiries` is a cache of the most recently completed run's
+# as-of state, not history -- `report_runs` is the durable artefact
+# (see the comment above the CREATE TABLE statements in schema.py).
+# =============================================================================
+
+
+def upsert_enquiry_state(
+    conn: sqlite3.Connection,
+    *,
+    mailbox: str,
+    state,  # app.enquiry.models.EnquiryState
+    computed_as_of: int,
+    updated_at: int,
+) -> int:
+    """Write one thread's current EnquiryState, replacing whatever was
+    there before for that `gmail_thread_id` (SPEC.md §14.2: `enquiries`
+    is a most-recent-run cache, always fully recomputed -- SPEC.md
+    §8.1 -- never patched field-by-field). Returns the row id.
+    """
+    conn.execute(
+        """
+        INSERT INTO enquiries (
+            gmail_thread_id, mailbox, customer_name, company, customer_email,
+            counterparty_type, subject, product, requirement, quantity, status,
+            last_sender, is_priority, priority_evidence, received_at,
+            last_activity_at, closed_at, closure_evidence, closure_kind,
+            computed_as_of, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(gmail_thread_id) DO UPDATE SET
+            mailbox = excluded.mailbox,
+            customer_name = excluded.customer_name,
+            company = excluded.company,
+            customer_email = excluded.customer_email,
+            counterparty_type = excluded.counterparty_type,
+            subject = excluded.subject,
+            product = excluded.product,
+            requirement = excluded.requirement,
+            quantity = excluded.quantity,
+            status = excluded.status,
+            last_sender = excluded.last_sender,
+            is_priority = excluded.is_priority,
+            priority_evidence = excluded.priority_evidence,
+            received_at = excluded.received_at,
+            last_activity_at = excluded.last_activity_at,
+            closed_at = excluded.closed_at,
+            closure_evidence = excluded.closure_evidence,
+            closure_kind = excluded.closure_kind,
+            computed_as_of = excluded.computed_as_of,
+            updated_at = excluded.updated_at
+        """,
+        (
+            state.gmail_thread_id, mailbox, state.customer_name, state.company, state.customer_email,
+            state.counterparty_type, state.subject, state.product, state.requirement, state.quantity,
+            state.status, state.last_sender, int(state.is_priority), state.priority_evidence,
+            state.received_at, state.last_activity_at, state.closed_at, state.closure_evidence,
+            state.closure_kind, computed_as_of, updated_at,
+        ),
+    )
+    row = conn.execute(
+        "SELECT id FROM enquiries WHERE gmail_thread_id = ?", (state.gmail_thread_id,)
+    ).fetchone()
+    return row["id"]
+
+
+def replace_enquiry_brands(conn: sqlite3.Connection, enquiry_id: int, brands: List[str]) -> None:
+    """Replace the full brand set for one enquiry -- state is always
+    fully recomputed (SPEC.md §8.1), so the brand set is too, never
+    incrementally patched. `ON DELETE CASCADE` on enquiry_brands
+    handles cleanup if the enquiry row itself is ever removed.
+    """
+    conn.execute("DELETE FROM enquiry_brands WHERE enquiry_id = ?", (enquiry_id,))
+    for brand in dict.fromkeys(brands):  # de-dup, preserve order
+        conn.execute(
+            "INSERT INTO enquiry_brands (enquiry_id, brand, raw_mention) VALUES (?, ?, ?)",
+            (enquiry_id, brand, brand),
+        )
+
+
+def insert_report_run(
+    conn: sqlite3.Connection,
+    *,
+    window_start: int,
+    window_end: int,
+    mode: str,
+    mailbox: str,
+    metrics_json: str,
+    report_text: str,
+    delivered: bool,
+    delivery_error: Optional[str],
+    created_at: int,
+) -> int:
+    """Every delivered (or attempted) report, for audit and re-send
+    (SPEC.md §14.2) -- the durable, reproducible artefact for this
+    window, independent of whatever `enquiries` looks like later.
+    """
+    cursor = conn.execute(
+        """
+        INSERT INTO report_runs (
+            window_start, window_end, mode, mailbox, metrics_json, report_text,
+            delivered, delivery_error, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (window_start, window_end, mode, mailbox, metrics_json, report_text, int(delivered), delivery_error, created_at),
+    )
+    return cursor.lastrowid

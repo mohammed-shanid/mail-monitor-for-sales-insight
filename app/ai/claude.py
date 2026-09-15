@@ -31,12 +31,15 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass
 from typing import List, Optional
 
 import anthropic
 
+from app.ai.prompts import MESSAGE_VERDICT_SCHEMA, MESSAGE_VERDICT_SYSTEM_PROMPT, SUMMARY_SYSTEM_PROMPT
 from app.config import CLAUDE_API_KEY
+from app.enquiry.models import ClosureKind, QuotationSignal, Verdict
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +132,19 @@ def _request(
 
     Low effort is intentional throughout this module: bounded
     classification/extraction/summarization, not open-ended agentic work.
+
+    Deliberately NO explicit `temperature` here: a live run against the
+    real API (Stage 4) discovered that this model rejects `temperature`
+    when combined with `output_config`'s `effort` key (HTTP 400:
+    "`temperature` is deprecated for this model"). An earlier attempt
+    to default `temperature=0` here for every caller passed every
+    mocked test (mocks don't inspect call kwargs) but would have broken
+    the bot's real Claude calls in production -- exactly the kind of
+    thing only a real API call catches. SPEC.md's temperature=0
+    requirement (Appendix A #8) is satisfied for the report path by
+    `_request_with_retry` below instead, which uses temperature without
+    `effort` (not a SPEC requirement, just this module's original
+    latency/cost knob) -- see that function's docstring.
     """
     output_config = {"effort": "low"}
     if schema is not None:
@@ -341,3 +357,241 @@ def summarize_enquiry(
     if summary is not None:
         logger.info("Claude enquiry summarization successful")
     return summary
+
+
+# =============================================================================
+# Report path (SPEC.md §15), added Stage 3. Everything above is unchanged
+# and still used by the bot exclusively (extract_new_enquiry,
+# classify_reply_intent, summarize_enquiry, and their prompts/schemas).
+# =============================================================================
+
+_RETRYABLE_STATUS_THRESHOLD = 500
+
+
+def _is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, (anthropic.RateLimitError, anthropic.APITimeoutError, anthropic.APIConnectionError)):
+        return True
+    if isinstance(exc, anthropic.APIStatusError) and exc.status_code >= _RETRYABLE_STATUS_THRESHOLD:
+        return True
+    return False
+
+
+def _request_with_retry(
+    *,
+    system: str,
+    user_content: str,
+    max_tokens: int,
+    schema: Optional[dict] = None,
+    max_retries: int = 3,
+    model: str = MODEL,
+):
+    """Like _request(), but retries with exponential backoff (1s, 2s,
+    4s, ...) on RateLimitError/APITimeoutError/APIConnectionError/5xx
+    APIStatusError, up to `max_retries` additional attempts (SPEC.md
+    §15.5, `AI_MAX_RETRIES`). A non-retryable failure (4xx, malformed
+    response, any other AnthropicError) returns None immediately, same
+    as _request(). Not built on top of _request() itself -- _request()
+    already swallows every exception into a bare None, which makes it
+    impossible to tell a retryable failure from a permanent one from
+    the outside. Used only by the Stage 3 functions below; the bot's
+    three functions above call the original _request() and are
+    unaffected by any of this.
+
+    temperature=0 always (never a parameter -- this project's Claude
+    calls are deterministic everywhere, no exceptions). Deliberately no
+    `effort` key in output_config here, unlike _request() above -- a
+    live run against the real API found the two mutually exclusive for
+    this model ("`temperature` is deprecated for this model" when both
+    are set). `effort` is not a SPEC requirement (SPEC.md never
+    mentions it); `temperature=0` is (Appendix A #8), so this keeps
+    that and drops the other. `output_config` is omitted entirely when
+    there is no schema, rather than sent empty.
+    """
+    request_kwargs = dict(
+        model=model,
+        max_tokens=max_tokens,
+        temperature=0,
+        system=system,
+        messages=[{"role": "user", "content": user_content}],
+    )
+    if schema is not None:
+        request_kwargs["output_config"] = {"format": {"type": "json_schema", "schema": schema}}
+
+    attempt = 0
+    while True:
+        try:
+            return _client().messages.create(**request_kwargs)
+        except anthropic.AnthropicError as exc:
+            retryable = _is_retryable(exc)
+            if retryable and attempt < max_retries:
+                delay = 2**attempt
+                logger.warning(
+                    "Claude API error (attempt %d/%d), retrying in %ds: %s",
+                    attempt + 1, max_retries, delay, exc,
+                )
+                time.sleep(delay)
+                attempt += 1
+                continue
+            logger.error(
+                "Claude API call failed (retryable=%s, attempts=%d): %s", retryable, attempt + 1, exc
+            )
+            return None
+
+
+_VERDICT_REQUIRED_FIELDS = (
+    "is_enquiry", "counterparty_type", "customer_name", "company", "product",
+    "requirement", "quantity", "brands", "quotation_signal", "closure_signal",
+    "closure_evidence", "closure_kind", "urgency", "urgency_evidence", "confidence",
+)
+_VERDICT_STRING_OR_NULL_FIELDS = (
+    "counterparty_type", "customer_name", "company", "product", "requirement",
+    "quantity", "quotation_signal", "closure_evidence", "closure_kind",
+    "urgency_evidence", "confidence",
+)
+_VERDICT_BOOL_OR_NULL_FIELDS = ("is_enquiry", "closure_signal", "urgency")
+_COUNTERPARTY_TYPES = {"customer", "supplier", "unknown"}
+
+
+def _validate_verdict(data: dict) -> Optional[Verdict]:
+    """Defense in depth: even with output_config enforcing the schema,
+    never trust model output blindly -- re-check shape and controlled
+    enums before it can reach the database (SPEC.md §15.2).
+    """
+    if not all(key in data for key in _VERDICT_REQUIRED_FIELDS):
+        logger.error("Claude message verdict missing required field(s): %s", list(data.keys()))
+        return None
+
+    for field in _VERDICT_BOOL_OR_NULL_FIELDS:
+        if data[field] is not None and not isinstance(data[field], bool):
+            logger.error("Verdict %s is not a bool/null: %r", field, data[field])
+            return None
+
+    for field in _VERDICT_STRING_OR_NULL_FIELDS:
+        if data[field] is not None and not isinstance(data[field], str):
+            logger.error("Verdict %s is not a string/null: %r", field, data[field])
+            return None
+
+    brands = data.get("brands")
+    if not isinstance(brands, list) or not all(isinstance(b, str) for b in brands):
+        logger.error("Verdict brands is not a list of strings: %r", brands)
+        return None
+
+    if data["quotation_signal"] is not None and data["quotation_signal"] not in QuotationSignal.ALL:
+        logger.error("Verdict quotation_signal outside the controlled set: %r", data["quotation_signal"])
+        return None
+    if data["closure_kind"] is not None and data["closure_kind"] not in ClosureKind.ALL:
+        logger.error("Verdict closure_kind outside the controlled set: %r", data["closure_kind"])
+        return None
+    if data["counterparty_type"] is not None and data["counterparty_type"] not in _COUNTERPARTY_TYPES:
+        logger.error("Verdict counterparty_type outside the controlled set: %r", data["counterparty_type"])
+        return None
+
+    return Verdict(
+        is_enquiry=data["is_enquiry"],
+        counterparty_type=data["counterparty_type"],
+        customer_name=data["customer_name"],
+        company=data["company"],
+        product=data["product"],
+        requirement=data["requirement"],
+        quantity=data["quantity"],
+        brands=list(brands),
+        quotation_signal=data["quotation_signal"],
+        closure_signal=data["closure_signal"],
+        closure_evidence=data["closure_evidence"],
+        closure_kind=data["closure_kind"],
+        urgency=data["urgency"],
+        urgency_evidence=data["urgency_evidence"],
+        confidence=data["confidence"],
+    )
+
+
+def classify_message(
+    *,
+    target_subject: str,
+    target_body: str,
+    context_messages: List[dict],
+    model: str = MODEL,
+    max_retries: int = 3,
+) -> Optional[Verdict]:
+    """Classify ONE message (SPEC.md §15.3), given the preceding thread
+    as context. `context_messages` is oldest-first, each a dict with
+    "sender" and "body" (already cleaned) -- the target message itself
+    is NOT included in context_messages; it is passed separately via
+    target_subject/target_body, so the cache key (gmail_message_id,
+    prompt_version) always corresponds to exactly what was judged.
+
+    Returns None on any API failure (after exhausting retries) or a
+    validation failure -- callers should treat that as "try again
+    later" (leave the message unanalysed for this run), never as "this
+    is not an enquiry" (SPEC.md §15.5: never fabricate a field to fill
+    a gap left by a failure).
+    """
+    if context_messages:
+        context_text = "\n\n".join(
+            f"[{m.get('sender', '')}]\n{m.get('body', '')}" for m in context_messages
+        )
+    else:
+        context_text = "(no earlier messages in this thread)"
+
+    user_content = (
+        f"Thread context (earlier messages, oldest first):\n{context_text}\n\n"
+        f"--- TARGET MESSAGE (classify this one) ---\n"
+        f"Subject: {target_subject}\n\n{target_body}"
+    )
+
+    response = _request_with_retry(
+        system=MESSAGE_VERDICT_SYSTEM_PROMPT,
+        user_content=user_content,
+        max_tokens=1024,
+        schema=MESSAGE_VERDICT_SCHEMA,
+        max_retries=max_retries,
+        model=model,
+    )
+    if response is None:
+        return None
+
+    text = _response_text(response)
+    if text is None:
+        return None
+
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.error("Claude returned malformed JSON for message verdict: %s", exc)
+        return None
+    if not isinstance(data, dict):
+        logger.error("Claude message-verdict JSON response was not an object: %r", data)
+        return None
+
+    verdict = _validate_verdict(data)
+    if verdict is not None:
+        logger.info("Claude message classification successful: is_enquiry=%s", verdict.is_enquiry)
+    else:
+        logger.error("Claude message classification failed validation")
+    return verdict
+
+
+def generate_summary(metrics: dict, *, model: str = MODEL, max_retries: int = 3) -> Optional[str]:
+    """SPEC.md §15.4: the summary call receives ONLY the computed
+    metrics object -- no raw email bodies, ever. The post-generation
+    numeral guard (asserting every number in the summary is one
+    Python already computed) lives in app.reporting.summary (Stage 4),
+    not here -- this function's only job is the API call itself.
+    """
+    user_content = json.dumps(metrics, sort_keys=True, default=str)
+
+    response = _request_with_retry(
+        system=SUMMARY_SYSTEM_PROMPT,
+        user_content=user_content,
+        max_tokens=512,
+        schema=None,
+        max_retries=max_retries,
+        model=model,
+    )
+    if response is None:
+        return None
+
+    text = _response_text(response)
+    if text is not None:
+        logger.info("Claude summary generation successful")
+    return text.strip() if text is not None else None

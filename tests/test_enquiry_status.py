@@ -181,5 +181,98 @@ def test_other_sender_never_changes_status():
     assert result == Status.NEW
 
 
+# =============================================================================
+# Report path (SPEC.md §0, §6.1, §6.2), added Stage 2. `classify_sender`
+# above is unchanged and still used by the bot exclusively.
+# =============================================================================
+
+from app.enquiry.models import AddressClass, Direction
+from app.enquiry.status import classify_address, direction_for_address_class
+
+MAILBOX = "u.ruma@regencyelectricals.com"
+ALIASES = ["rahul@regencyelectricals.com"]
+INTERNAL_DOMAINS = ["regencyelectricals.com"]
+
+
+def test_classify_address_mailbox_is_employee():
+    result = classify_address(
+        f"Ruma <{MAILBOX}>", mailbox=MAILBOX, employee_aliases=ALIASES, internal_domains=INTERNAL_DOMAINS
+    )
+    assert result == AddressClass.EMPLOYEE
+
+
+def test_classify_address_alias_is_employee():
+    result = classify_address(
+        "Rahul <rahul@regencyelectricals.com>",
+        mailbox=MAILBOX,
+        employee_aliases=ALIASES,
+        internal_domains=INTERNAL_DOMAINS,
+    )
+    assert result == AddressClass.EMPLOYEE
+
+
+def test_classify_address_is_case_insensitive():
+    result = classify_address(
+        f"RUMA <{MAILBOX.upper()}>", mailbox=MAILBOX, employee_aliases=ALIASES, internal_domains=INTERNAL_DOMAINS
+    )
+    assert result == AddressClass.EMPLOYEE
+
+
+def test_classify_address_colleague_on_internal_domain_is_internal_not_employee():
+    # A colleague on the same domain who is NOT the mailbox/an alias --
+    # this is the whole point of splitting AddressClass from Direction.
+    result = classify_address(
+        "Priya <priya@regencyelectricals.com>",
+        mailbox=MAILBOX,
+        employee_aliases=ALIASES,
+        internal_domains=INTERNAL_DOMAINS,
+    )
+    assert result == AddressClass.INTERNAL
+
+
+def test_classify_address_external_domain_is_external():
+    result = classify_address(
+        "ABC Industries <purchase@abc.com>",
+        mailbox=MAILBOX,
+        employee_aliases=ALIASES,
+        internal_domains=INTERNAL_DOMAINS,
+    )
+    assert result == AddressClass.EXTERNAL
+
+
+def test_classify_address_unparseable_is_external():
+    result = classify_address(
+        "not an email", mailbox=MAILBOX, employee_aliases=ALIASES, internal_domains=INTERNAL_DOMAINS
+    )
+    assert result == AddressClass.EXTERNAL
+
+
+def test_classify_address_empty_employee_aliases_and_internal_domains():
+    result = classify_address("someone@example.com", mailbox=MAILBOX, employee_aliases=[], internal_domains=[])
+    assert result == AddressClass.EXTERNAL
+
+
+def test_classify_address_no_mailbox_configured_never_matches_employee():
+    result = classify_address(f"Ruma <{MAILBOX}>", mailbox="", employee_aliases=[], internal_domains=[])
+    assert result == AddressClass.EXTERNAL
+
+
+# --- direction_for_address_class ---------------------------------------------
+
+
+def test_direction_employee_is_outbound():
+    assert direction_for_address_class(AddressClass.EMPLOYEE) == Direction.OUTBOUND
+
+
+def test_direction_internal_is_inbound():
+    # SPEC.md §6.1: only the employee identity flips direction --
+    # an internal colleague's message is still inbound.
+    assert direction_for_address_class(AddressClass.INTERNAL) == Direction.INBOUND
+
+
+def test_direction_external_is_inbound():
+    assert direction_for_address_class(AddressClass.EXTERNAL) == Direction.INBOUND
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
