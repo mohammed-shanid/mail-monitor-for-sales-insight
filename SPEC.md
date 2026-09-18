@@ -1074,3 +1074,35 @@ The failures most likely to produce a silently wrong report:
     path must **never both write** to `enquiries` — their status vocabularies are
     incompatible and whichever runs last silently wins. `scripts/sync_gmail.py` is retired
     from use once `report.py` exists.
+
+---
+
+## Appendix B — Implementation Status (paused 2026-09-18)
+
+Not part of the specification itself — a snapshot for whoever resumes this project, so the
+first hour back isn't spent re-deriving what's already true. If this section and the rest of
+SPEC.md ever disagree about what *should* be built, SPEC.md's body still wins; this appendix
+only records what *has been* built and what is still open.
+
+**Complete:** all four implementation stages (config/CLI/timewindow; Gmail
+ingestion/idempotency; Claude analysis with cached verdicts; metrics/render/Telegram
+delivery). 474 automated tests pass. `python report.py --dry-run` has run end-to-end against
+the real mailbox with real Gmail auth, real Claude classification, and a correctly formatted
+report. See `PHASE0_AUDIT.md` (repository state before this work started) and
+`PHASE0_DECISIONS.md` (the 18 decisions that shaped this build, including the amendments
+already folded into the body of this document) for the full history.
+
+**Open, unresolved:**
+- A real (non-`--dry-run`) Telegram send has never been performed. `app/telegram/client.py`'s
+  `send()` is implemented and tested against mocks only.
+- A live diagnostic (`--date 12/09/2026` returning 0 enquiries despite one manually-verified
+  genuine enquiry) traced the cause to §6.2's internal-domain exclusion applied literally to
+  the sender's address: a colleague on `INTERNAL_DOMAINS` emailed the mailbox owner with
+  subject "Enquiry", and per §6.2 that message is never sent to Claude and the thread can
+  never become an enquiry, regardless of content. The code matches this document exactly.
+  Left open: whether §6.2 should carve out an exception for a staff member relaying an
+  external customer's request through their own internal address, which this document
+  currently has no mechanism to detect (direction is deterministic from the `From:` header
+  only, per §6.1 — never content, never AI). No change has been made pending a decision.
+- `.gitignore`'s last line (`PHASE0_AUDIT.md PHASE0_DECISIONS.md`, space-separated) does not
+  actually ignore either file — cosmetic, both files are tracked and contain no secrets.
